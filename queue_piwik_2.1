@@ -1,0 +1,147 @@
+#!/usr/bin/python
+import sys, re, os, time, io, subprocess, logging, json, uuid
+
+logging.basicConfig(filename='/var/log/queue_piwik.log',level=logging.DEBUG)
+
+from nginx_log_parser import NginxLogParser
+from dateutil.parser import parse
+
+import _strptime
+from datetime import datetime, timedelta
+from pytz import timezone, utc
+from pytz.tzinfo import StaticTzInfo
+from shlex import split
+
+
+class OffsetTime(StaticTzInfo):
+    def __init__(self, offset):
+        """A dumb timezone based on offset such as +0530, -0600, etc.
+        """
+        hours = int(offset[:3])
+        minutes = int(offset[0] + offset[3:])
+        self._utcoffset = timedelta(hours=hours, minutes=minutes)
+
+def load_datetime(value, format):
+    if format.endswith('%z'):
+        format = format[:-2]
+        offset = value[-5:]
+        value = value[:-5]
+        return OffsetTime(offset).localize(datetime.strptime(value, format))
+
+    return datetime.strptime(value, format)
+
+def dump_datetime(value, format):
+    return value.strftime(format)
+
+parser = NginxLogParser('$request_time $remote_addr $sent_http_x_cache [$time_local] ' + \
+			'"$request" $http_host $status $body_bytes_sent ' + \
+			'"$http_referer" "$http_user_agent" "$http_range"')
+a_k1 = re.compile('(\/[a-zA-Z0-9]{32}\/[a-zA-Z0-9]{8}\/)+')
+a_k11 = re.compile('(\/[a-zA-Z0-9]{32}\/[a-zA-Z0-9]{10}\/)+')
+a_k2 = re.compile('(\/[a-zA-Z0-9]{32}\/)+')
+a_k3 = re.compile('(\/[a-zA-Z0-9]{42}\/)+')
+
+a_ts = re.compile('(.*)\/[0-9]+\.(ts)')
+a_ts1 = re.compile('(.*)\_[0-9]+\.(ts)')
+a_ts2= re.compile('(.*)(?:[_-])[0-9]+\.(ts|m3u8)')
+
+a_ts3= re.compile('(.*\/)([^\/]{43})(\/live\/_definst_\/.*\.m3u8)')
+a_ts4= re.compile('(.*\/)([^\/]{46})(\/.*\.m3u8)')
+
+h_k1 = re.compile("^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(\:\d+)?$")
+h_k2 = re.compile("\:\d+")
+
+
+#cdn_gg0 = re.compile("^.*(htv|thvl|mkocdn|cgame|easyvideo|zdn|vcdn).*$")
+has_port = re.compile("^.*\:[0-9]+.*$")
+#cdn_gg0 = re.compile("^.*(thvl|yan|htv|mkocdn|vtv|vivid).*$")
+
+
+
+def process_message(pp):
+    if not pp or pp is None or 'time_local' not in pp or pp['time_local'] is None or 'status' not in pp or pp['status'] is None or 'body_bytes_sent' not in pp or  pp['body_bytes_sent'] is None or 'request_time' not in pp or pp['request_time'] is None:
+        return None
+
+    cur = load_datetime(pp['time_local'], '%d/%b/%Y:%H:%M:%S %z')
+    localtime = cur.isoformat()
+
+    timezonerr = pp['time_local'].split(" ")
+    if len(timezonerr) < 1 :
+        return None
+    timezone = timezonerr[1]
+    request_urirr =  pp["request"].split(" ")
+    if len(request_urirr) < 1 :
+        return None 
+    request_uri = request_urirr[1]
+    request_uri = request_uri.split('?')[0]
+
+    request_uri = re.sub(a_k1,'/$tk$/$ts$/', request_uri, re.M)
+    request_uri = re.sub(a_k11,'/$tk$/$tk1$/', request_uri, re.M)
+    request_uri = re.sub(a_k2,'/$tk$//', request_uri, re.M)
+    request_uri = re.sub(a_k3,'/$tk$//', request_uri, re.M)
+    request_uri = re.sub(a_ts,r'\1/$idx$.\2', request_uri , re.M)
+    request_uri = re.sub(a_ts1,r'\1_$idx$.\2', request_uri , re.M)
+    request_uri = re.sub(a_ts2,r'\1_$idx$.\2', request_uri , re.M)
+
+    request_uri = re.sub(a_ts3,r'\1_$tk$.\2', request_uri , re.M)
+    #request_uri = re.sub(a_ts4,r'\1_$tk$.\2', request_uri , re.M)
+
+
+    referer = pp["http_referer"]
+    referer = referer.split('?')[0]
+
+    http_host = pp["http_host"].strip()
+    if re.match(has_port, http_host):
+        return None
+#    if not re.match(cdn_gg0, http_host):
+#        return None
+    if http_host == '-':
+        return None
+    match_ip = re.match(h_k1,http_host)
+    if match_ip:
+        return  None
+    match_port = re.match(h_k2,http_host)
+    if match_port:
+        return None
+
+    body_bytes_sent = pp["body_bytes_sent"]
+    if pp["status"] == "206":
+        pp["status"] = "200"
+    return json.dumps({
+        "ip": pp["remote_addr"],
+        "host": http_host,
+        "path": request_uri,
+        "status": pp["status"],
+        "referrer": referer,
+        "user_agent": pp["http_user_agent"],
+        "length": body_bytes_sent,
+        "generation_time_milli": pp["request_time"],
+        "timezone":timezone,
+        "date": localtime})
+
+commandline = '/data/app/bimax-counters/extract/piwik_pipe.sh'
+
+if __name__ == "__main__":
+    ff = sys.argv[1]
+    id = sys.argv[2]
+    port = sys.argv[3]
+    if not id:
+        id = 1
+    command = split("%s %s %s" % (commandline, id, port))
+    s = subprocess.Popen(command, bufsize=1, stdin=subprocess.PIPE)
+    with open(ff, "r") as f:
+        for line in f:
+            try:
+		    if not line or line is None:
+			continue
+		    msgp = parser.parse_line(line)
+		    if not msgp or msgp is None:
+			continue
+		    mm = process_message(msgp)
+		    if mm is not None:
+			#logging.info("%s" % str(mm))
+			s.stdin.write("%s\n" % str(mm))
+            except Exception, err:
+                logging.debug(err);
+                pass
+
